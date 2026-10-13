@@ -20,6 +20,7 @@
 #include <WiFiClientSecure.h>
 #include <Update.h>
 #include <esp_ota_ops.h>
+#include <ChronosESP32.h>   // nhan du lieu chi duong Google Maps tu app Chronos qua BLE
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <LittleFS.h>
@@ -172,7 +173,7 @@ static uint8_t brightnessIdx = 0;
 
 enum WeatherKind { WX_CLEAR, WX_PARTLY, WX_CLOUDY, WX_FOG, WX_RAIN, WX_SNOW, WX_STORM };
 
-struct Weather {
+struct WeatherNow {
   bool valid = false;
   float temp = 0, feels = 0, wind = 0, tMax = 0, tMin = 0;
   int humidity = 0, code = 0;
@@ -180,7 +181,7 @@ struct Weather {
   char updatedAt[6] = "";
 };
 
-static Weather weather;
+static WeatherNow weather;
 
 // Khu vuc xem thoi tiet: tu dong theo dia chi IP cua mang (mac dinh) hoac nhap tay tren trang web.
 // Gia tri khoi dau lay tu config.h; ket qua tra cuu / nhap tay duoc luu NVS.
@@ -1095,7 +1096,8 @@ static const uint32_t SETTINGS_IDLE_MS = 60000;
 static bool inSettings = false;
 
 // Dang hien man hinh khac (cai dat hoac nhac) de len dong ho: khong ve dong ho / thoi tiet
-static bool overlayActive() { return inSettings || inMusic; }
+static bool inNav = false;   // man hinh chi duong (app Chronos)
+static bool overlayActive() { return inSettings || inMusic || inNav; }
 static SleepSchedule editSched;
 static uint8_t editField = 0;
 static bool settingsFull = false;        // ve lai toan bo (chi khi vua vao man hinh cai dat)
@@ -2205,6 +2207,231 @@ static void exitMusic() {
   Serial.println("Nhac: tat");
 }
 
+// ---------- Chi duong Google Maps (app Chronos gui qua BLE) ----------
+// Dien thoai chay app Chronos, ket noi toi BLE "M5Clock" va bat Dan duong tren Google Maps:
+// dong ho nhan icon re (48x48, 1 bit), khoang cach, ten duong, thoi gian con lai, gio den.
+// Thu vien phan tich goi tin ngay trong task BLE, nen du lieu duoc chep sang `navSnap` (co mutex)
+// roi loop() moi doc ban sao, tranh doc String dang bi ghi.
+static ChronosESP32 chronos("M5Clock", CF_ESP32_240x240);
+static SemaphoreHandle_t navMutex = nullptr;
+static Navigation navSnap;                 // ban chep moi nhat tu task BLE (bao ve boi navMutex)
+static volatile uint32_t navSeq = 0;       // tang moi lan navSnap doi
+static uint32_t navSeqSeen = 0;
+static Navigation navLocal;                // ban chep cua loop(), dung de ve
+static volatile bool chronosLinked = false;
+static bool navAuto = false;               // vao man hinh do dien thoai bat dan duong (khong phai do nguoi dung)
+static bool navDismissed = false;          // nguoi dung vua thoat: khong tu vao lai cho den khi het dan duong
+static bool navFull = false;
+static String navSig;
+static M5Canvas navIcon;
+static bool navIconReady = false;
+static const int NAV_ICON_PX = 48, NAV_ICON_SCALE = 3, NAV_ICON_SIZE = NAV_ICON_PX * NAV_ICON_SCALE;
+
+static void onChronosConnection(bool linked) {
+  chronosLinked = linked;
+  toastText = linked ? "Chronos: da ket noi" : "Chronos: mat ket noi";
+  toastUntil = millis() + 3000;
+  lastSecond = 0;
+  Serial.printf("Chronos: %s\n", linked ? "da ket noi" : "mat ket noi");
+}
+
+static void onChronosConfig(Config cfg, uint32_t, uint32_t) {
+  if (cfg != CF_NAV_DATA && cfg != CF_NAV_ICON) return;
+  if (xSemaphoreTake(navMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    navSnap = chronos.getNavigation();
+    navSeq++;
+    xSemaphoreGive(navMutex);
+  }
+}
+
+// Lay ban chep moi neu co thay doi; true khi navLocal vua doi
+static bool navPoll() {
+  if (navSeq == navSeqSeen) return false;
+  if (xSemaphoreTake(navMutex, pdMS_TO_TICKS(20)) != pdTRUE) return false;
+  navLocal = navSnap;
+  navSeqSeen = navSeq;
+  xSemaphoreGive(navMutex);
+  return true;
+}
+
+static bool navIsLive() { return chronosLinked && navLocal.active && navLocal.isNavigation; }
+
+static bool isAscii(const String &s) {
+  for (size_t i = 0; i < s.length(); i++) if ((uint8_t)s[i] >= 0x80) return false;
+  return true;
+}
+
+// Ve van ban xuong dong theo tu, toi da maxLines dong (dong cuoi cat bang "...")
+static void drawWrapped(const String &text, int x, int y, int maxW, int maxLines, int lineH) {
+  auto &d = M5.Display;
+  String rest = text;
+  rest.trim();
+  for (int lines = 0; rest.length() && lines < maxLines; lines++) {
+    String line;
+    int end = 0;
+    if (lines < maxLines - 1) {
+      int pos = 0;
+      while (pos < (int)rest.length()) {
+        int sp = rest.indexOf(' ', pos);
+        int e = sp < 0 ? (int)rest.length() : sp;
+        if (d.textWidth(rest.substring(0, e).c_str()) > maxW) break;
+        end = e;
+        if (sp < 0) break;
+        pos = e + 1;
+      }
+    }
+    if (end == 0) {   // dong cuoi, hoac mot tu dai hon khung: cat bot
+      line = shortenToFit(rest, maxW);
+      rest = "";
+    } else {
+      line = rest.substring(0, end);
+      rest = rest.substring(end);
+      rest.trim();
+    }
+    d.drawString(line.c_str(), x, y + lines * lineH);
+  }
+}
+
+static void drawNavScreen(const struct tm &t) {
+  auto &d = M5.Display;
+  const bool linked = chronosLinked;
+  const Navigation &n = navLocal;
+  const bool live = navIsLive();
+
+  d.fillScreen(TFT_BLACK);
+  d.fillRect(0, 0, d.width(), HEADER_H, COL_HEADER);
+  d.loadFont(VI_B18);
+  d.setTextDatum(m5gfx::textdatum_t::middle_left);
+  d.setTextColor(TFT_WHITE, COL_HEADER);
+  d.drawString("Chỉ đường", 8, HEADER_H / 2);
+  d.unloadFont();
+  char hm[8] = "--:--";
+  if (timeValid(t)) snprintf(hm, sizeof(hm), "%02d:%02d", t.tm_hour, t.tm_min);
+  d.setFont(&fonts::FreeSansBold9pt7b);
+  d.setTextDatum(m5gfx::textdatum_t::middle_right);
+  d.drawString(hm, d.width() - 24, HEADER_H / 2);
+  d.fillCircle(d.width() - 10, HEADER_H / 2, 5, linked ? TFT_GREEN : 0x4208);   // bluetooth: xanh = da ket noi
+  if (live && n.speed.length() && isAscii(n.speed)) {   // toc do (chi co khi dung app OsmAnd)
+    d.setFont(&fonts::FreeSansBold9pt7b);
+    d.setTextDatum(m5gfx::textdatum_t::middle_left);
+    d.setTextColor(COL_ACCENT, COL_HEADER);
+    d.drawString(n.speed.c_str(), 118, HEADER_H / 2);
+  }
+
+  if (!live) {
+    String l1, l2;
+    if (!linked) {
+      l1 = "Chưa kết nối Chronos";
+      l2 = "Mở app Chronos, chọn thiết bị M5Clock";
+    } else if (n.active && !n.isNavigation) {   // thong tin chung: vi du chua cap quyen thong bao
+      l1 = n.title.length() ? n.title : String("Chronos");
+      l2 = n.directions;
+    } else {
+      l1 = "Chưa dẫn đường";
+      l2 = "Bắt đầu dẫn đường trên Google Maps";
+    }
+    d.setTextDatum(m5gfx::textdatum_t::middle_center);
+    d.loadFont(VI_B18);
+    d.setTextColor(TFT_WHITE);
+    d.drawString(l1.c_str(), 160, 100);
+    d.unloadFont();
+    d.loadFont(VI_R14);
+    d.setTextColor(COL_DIM);
+    d.drawString(shortenToFit(l2, 300).c_str(), 160, 135);
+    d.unloadFont();
+    return;
+  }
+
+  // Icon re (48x48, bit cao truoc, hang truoc; bit 1 = diem sang) phong to 3 lan trong the toi
+  const int cardX = 6, cardY = 32, cardW = NAV_ICON_SIZE + 8;
+  d.fillRoundRect(cardX, cardY, cardW, cardW, 10, COL_HEADER);
+  if (!navIconReady) {
+    navIcon.setPsram(true);
+    navIcon.setColorDepth(16);
+    navIconReady = navIcon.createSprite(NAV_ICON_SIZE, NAV_ICON_SIZE) != nullptr;
+  }
+  if (n.hasIcon && navIconReady) {
+    navIcon.fillSprite(COL_HEADER);
+    for (int y = 0; y < NAV_ICON_PX; y++) {
+      for (int x = 0; x < NAV_ICON_PX; x++) {
+        int bit = y * NAV_ICON_PX + x;
+        if ((n.icon[bit >> 3] >> (7 - (bit & 7))) & 1) {
+          navIcon.fillRect(x * NAV_ICON_SCALE, y * NAV_ICON_SCALE, NAV_ICON_SCALE, NAV_ICON_SCALE, TFT_WHITE);
+        }
+      }
+    }
+    navIcon.pushSprite(&d, cardX + 4, cardY + 4);
+  }
+
+  // Khoang cach toi diem re tiep theo (chu to), ten duong / huong dan ben duoi
+  const int rx = cardX + cardW + 10, rw = d.width() - rx - 6;
+  d.setTextDatum(m5gfx::textdatum_t::top_left);
+  d.setTextColor(col(C_TIME));
+  bool big = false;
+  if (isAscii(n.title)) {
+    d.setFont(&fonts::FreeSansBold18pt7b);
+    big = d.textWidth(n.title.c_str()) <= rw;
+    if (!big) d.setFont(&fonts::FreeSansBold12pt7b);
+    d.drawString(n.title.c_str(), rx, big ? 36 : 42);
+  } else {
+    d.loadFont(VI_B18);
+    d.drawString(shortenToFit(n.title, rw).c_str(), rx, 42);
+    d.unloadFont();
+  }
+  d.loadFont(VI_R18);
+  d.setTextColor(TFT_WHITE);
+  drawWrapped(n.directions, rx, 86, rw, 4, 24);
+  d.unloadFont();
+
+  // Hang duoi: con lai | quang duong | gio den
+  String eta = n.eta;
+  int comma = eta.indexOf(',');
+  if (comma > 0) eta = eta.substring(0, comma);   // "21:45,13 Oct" -> chi lay gio
+  const char *labels[3] = {"Còn lại", "Quãng đường", "Đến lúc"};
+  const String vals[3] = {n.duration, n.distance, eta};
+  const int cw = d.width() / 3, rowY = 188;
+  d.drawFastHLine(8, rowY - 6, d.width() - 16, 0x4208);
+  d.setTextDatum(m5gfx::textdatum_t::top_center);
+  for (int i = 0; i < 3; i++) {
+    d.loadFont(VI_R14);
+    d.setTextColor(COL_DIM);
+    d.drawString(labels[i], cw * i + cw / 2, rowY);
+    d.unloadFont();
+    d.loadFont(VI_B18);
+    d.setTextColor(TFT_WHITE);
+    d.drawString(shortenToFit(vals[i], cw - 6).c_str(), cw * i + cw / 2, rowY + 22);
+    d.unloadFont();
+  }
+}
+
+static void enterNav(bool autoMode) {
+  navAuto = autoMode;
+  navFull = true;
+  navSig = "";
+  inNav = true;
+  Serial.printf("Chi duong: vao man hinh (%s)\n", autoMode ? "tu dong" : "thu cong");
+}
+
+static void exitNav() {
+  inNav = false;
+  navIcon.deleteSprite();   // tra lai ~41 KB
+  navIconReady = false;
+  bgChanged = true;   // loop() ve lai man hinh dong ho
+  Serial.println("Chi duong: thoat");
+}
+
+// Ve lai khi du lieu / ket noi / phut thay doi
+static void navFrame() {
+  time_t now = time(nullptr);
+  struct tm t;
+  localtime_r(&now, &t);
+  String sig = String(chronosLinked) + "|" + String(navSeqSeen) + "|" + String(t.tm_hour * 60 + t.tm_min);
+  if (!navFull && sig == navSig) return;
+  navFull = false;
+  navSig = sig;
+  drawNavScreen(t);
+}
+
 // Mot khung: lay 256 mau moi nhat tu micro, phan tich, cap nhat cot / vien / LED
 static void musicFrame(uint32_t nowMs) {
   auto &d = M5.Display;
@@ -2688,6 +2915,11 @@ void setup() {
   loadCustomBg();
   loadCustomChime();
 
+  navMutex = xSemaphoreCreateMutex();
+  chronos.setConnectionCallback(onChronosConnection);
+  chronos.setConfigurationCallback(onChronosConfig);
+  chronos.begin();   // phat BLE "M5Clock" cho app Chronos
+
   leds.begin();
   leds.setBrightness(LED_BRIGHTNESS);
   leds.clear();
@@ -2773,6 +3005,8 @@ void loop() {
       settingsFull = true;
     } else if (inMusic) {
       musicFull = true;
+    } else if (inNav) {
+      navFull = true;
     } else {
       drawBg(M5.Display, 0, 0, 0, 0, M5.Display.width(), M5.Display.height());
       lastMinute = -1;
@@ -2856,8 +3090,23 @@ void loop() {
     lastActivityMs = nowMs;   // dang xem nhac: khong tu ngu theo lich
     if (swipeRight) {
       exitMusic();
+    } else if (swipeLeft) {   // tiep tuc vuot trai: sang man hinh chi duong
+      exitMusic();
+      enterNav(false);
     } else if (btnBClick) {
       setMusicStyle(musicStyle + 1);   // nut B: doi kieu song nhac
+    } else if (btnBHold) {
+      enterSleep(true);
+      ignoreB = true;
+    } else if (btnCDown) {
+      brightnessIdx = (brightnessIdx + 1) % sizeof(BRIGHTNESS_LEVELS);
+      M5.Display.setBrightness(BRIGHTNESS_LEVELS[brightnessIdx]);
+    }
+  } else if (inNav) {
+    lastActivityMs = nowMs;   // dang chi duong: khong tu ngu theo lich
+    if (swipeLeft || swipeRight) {
+      exitNav();
+      navDismissed = true;
     } else if (btnBHold) {
       enterSleep(true);
       ignoreB = true;
@@ -2885,6 +3134,27 @@ void loop() {
   } else if (tapDate) {
     setDateMode(dateMode == 2 ? 0 : dateMode + 1);   // 2 -> 0 -> 1 -> 2
   }
+
+  // BLE Chronos: gui pin cho app, tu vao / thoat man hinh chi duong theo trang thai dan duong
+  chronos.loop();
+  static uint32_t lastBattMs = 0;
+  if (nowMs - lastBattMs >= 30000) {
+    lastBattMs = nowMs;
+    chronos.setBattery((uint8_t)constrain((int)M5.Power.getBatteryLevel(), 0, 100),
+                       M5.Power.isCharging() == m5::Power_Class::is_charging);
+  }
+  navPoll();
+  if (!navIsLive()) {
+    navDismissed = false;
+    if (inNav && navAuto) exitNav();
+  } else if (!inNav && !navDismissed && !inSettings) {
+    if (sleeping && !manualSleep) wakeUp();   // dang trong gio ngu theo lich: bat man hinh khi dan duong
+    if (!sleeping) {
+      if (inMusic) exitMusic();
+      enterNav(true);
+    }
+  }
+  if (inNav) navFrame();
 
   if (inMusic) musicFrame(nowMs);
 
@@ -2933,7 +3203,7 @@ void loop() {
       drawClock(t);
     } else if (inMusic && !musicFull) {
       drawMusicClock(t);
-    }
+    }   // man hinh chi duong tu ve gio trong navFrame()
 
     // Lich ngu: vao khoang ngu thi tat sau khi het thao tac; het khoang ngu thi tu danh thuc
     bool inWindow = inSleepWindow(t);

@@ -47,7 +47,7 @@ pio run -d D:\tailieu\m5stack\new -t upload
 | Mục | Giá trị |
 |---|---|
 | Nền tảng | `espressif32`, board `m5stack-core2`, framework `arduino` |
-| Thư viện | `M5Unified` (kéo theo `M5GFX`), `Adafruit NeoPixel`, `ArduinoJson` 7 |
+| Thư viện | `M5Unified` (kéo theo `M5GFX`), `Adafruit NeoPixel`, `ArduinoJson` 7, `ChronosESP32` (kéo theo `NimBLE-Arduino`, `ESP32Time`) |
 | Thư viện của Arduino core | `WiFi`, `HTTPClient`, `WebServer`, `DNSServer`, `ESPmDNS`, `LittleFS`, `Preferences` |
 | Phân vùng | `default_16MB.csv`: ứng dụng 6,4 MB, NVS 20 KB, LittleFS (`spiffs`) 3,4 MB |
 | Kích thước hiện tại | firmware khoảng 1,8 MB (~28% phân vùng ứng dụng) |
@@ -199,6 +199,26 @@ Kiểu *Cột* vẽ trực tiếp phần thay đổi; các kiểu còn lại d�
 
 > Loa và micro dùng chung I2S trên Core2, nên vào màn hình nhạc thì tắt loa (`Speaker.end`) và chuông báo giờ
 > bị bỏ qua cho tới khi thoát.
+
+---
+
+## 6b. Màn hình chỉ đường (Google Maps qua app Chronos)
+
+Điện thoại chạy app **Chronos** (fbiego), kết nối BLE tới thiết bị **M5Clock**, bật dẫn đường trên Google Maps.
+Đồng hồ dùng thư viện `fbiego/ChronosESP32` (NimBLE) để nhận: icon rẽ 48×48 1-bit (phóng 3×), khoảng cách tới điểm
+rẽ (`title`), tên đường/hướng dẫn, thời gian còn lại, quãng đường, giờ đến.
+
+- **Tự vào / thoát**: có dữ liệu dẫn đường (`active && isNavigation`) thì tự vào màn hình (kể cả đang ngủ theo lịch),
+  hết dẫn đường hoặc mất kết nối BLE thì tự về đồng hồ. Vuốt ngang để thoát tay (không tự vào lại cho tới khi
+  hết chuyến). Từ màn hình nhạc vuốt trái để vào thủ công.
+- **Luồng**: thư viện phân tích gói ngay trong task BLE, nên callback chép `Navigation` sang `navSnap` (mutex) rồi
+  `loop()` mới đọc bản sao `navLocal` (`navPoll()`), tránh đọc `String` đang bị ghi.
+- Mã: khối `Chi duong Google Maps` trong `main.cpp` (`drawNavScreen`, `navFrame`, `enterNav/exitNav`).
+- Thư viện có `struct Weather` toàn cục nên struct thời tiết của dự án đổi tên `WeatherNow`.
+
+> **IRAM**: WiFi + BLE làm tràn IRAM của Arduino-ESP32 2.0.x. `tools/slim_iram.py` (extra_scripts) tạo bản sao
+> `sections.ld` bỏ nhóm hàm thời gian của libc (strftime, strptime, mktime, tzset…, ~10 KB) khỏi IRAM; chúng chạy
+> từ flash. Nếu sau này lại tràn IRAM, xem `.pio/build/.../firmware.map` mục `.iram0.text`.
 
 ---
 
